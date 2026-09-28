@@ -432,6 +432,23 @@ def gather_clip_info(qs):
     }
 
 
+def gather_clip_properties(qs):
+    item, err = _clip_at({
+        "trackType": qs.get("track_type", ["video"])[0],
+        "trackIndex": int(qs.get("track_index", ["1"])[0]),
+        "clipIndex": int(qs.get("clip_index", ["0"])[0]),
+    })
+    if err:
+        return err
+    props = safe(lambda: item.GetProperty()) or {}
+    if not isinstance(props, dict):
+        props = {}
+    return {
+        "clipName": safe(lambda: item.GetName()),
+        "properties": props,
+    }
+
+
 def gather_clip_markers(qs):
     """Get markers on a specific timeline item."""
     _, _, tl, err = _timeline()
@@ -2632,6 +2649,7 @@ GET_ROUTES = {
     "/mediapool/structure":     gather_media_pool_structure,
     "/mediapool/clip/metadata": gather_clip_metadata,
     "/mediapool/clip/info":     gather_clip_info,
+    "/clip/properties":         gather_clip_properties,
     "/clip/markers":            gather_clip_markers,
     "/clip/flags":              gather_clip_flags,
     "/clip/node-graph":         gather_node_graph,

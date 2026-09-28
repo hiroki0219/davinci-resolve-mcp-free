@@ -16,6 +16,7 @@ import subprocess
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 from typing import Dict, Any, List, Optional
 
 
@@ -78,7 +79,7 @@ mcp = FastMCP(
 def _get(endpoint: str, params: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     url = f"{BRIDGE_URL}{endpoint}"
     if params:
-        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        qs = urllib.parse.urlencode(params)
         url = f"{url}?{qs}"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -396,6 +397,267 @@ def insert_to_timeline(
     if end_frame >= 0:
         payload["endFrame"] = end_frame
     return _post("/media/insert", payload)
+
+
+
+@mcp.tool()
+def rebuild_timeline_from_segments(
+    clip_name: str,
+    timeline_name: str,
+    segments: list[dict[str, int]],
+    track_index: int = 1,
+) -> Dict[str, Any]:
+    """Create a new timeline and rebuild a source clip from selected KEEP segments.
+
+    This is a safe, non-destructive editing tool. It always creates a new
+    timeline and never intentionally edits the timeline that was active
+    before this call.
+
+    Segment ranges use source frames with an EXCLUSIVE end frame:
+        {"start_frame": 0, "end_frame": 150}
+    keeps frames [0, 150), for a duration of 150 frames.
+
+    Args:
+        clip_name: Name of the source clip in the media pool.
+        timeline_name: Name of the new timeline to create.
+        segments: Ordered KEEP ranges. Each item must contain
+            start_frame and end_frame.
+        track_index: 1-based video track index. Defaults to V1.
+    """
+
+    # ---------------------------------------------------------------
+    # Validate everything BEFORE making any changes in Resolve.
+    # ---------------------------------------------------------------
+
+    if not clip_name or not isinstance(clip_name, str):
+        return {"error": "clip_name is required"}
+
+    if not timeline_name or not isinstance(timeline_name, str):
+        return {"error": "timeline_name is required"}
+
+    if not isinstance(track_index, int) or track_index < 1:
+        return {"error": "track_index must be an integer >= 1"}
+
+    if not isinstance(segments, list) or not segments:
+        return {"error": "segments must be a non-empty list"}
+
+    normalized_segments = []
+
+    for i, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            return {
+                "error": f"segment {i} must be an object with start_frame and end_frame"
+            }
+
+        start = segment.get("start_frame")
+        end = segment.get("end_frame")
+
+        if not isinstance(start, int) or not isinstance(end, int):
+            return {
+                "error": f"segment {i}: start_frame and end_frame must be integers"
+            }
+
+        if start < 0:
+            return {
+                "error": f"segment {i}: start_frame must be >= 0"
+            }
+
+        if end <= start:
+            return {
+                "error": f"segment {i}: end_frame must be greater than start_frame"
+            }
+
+        normalized_segments.append({
+            "start_frame": start,
+            "end_frame": end,
+            "duration": end - start,
+        })
+
+    # Require source ranges to be in chronological order and non-overlapping.
+    for i in range(1, len(normalized_segments)):
+        previous = normalized_segments[i - 1]
+        current = normalized_segments[i]
+
+        if current["start_frame"] < previous["end_frame"]:
+            return {
+                "error": (
+                    f"segment {i} overlaps or is out of order: "
+                    f"previous ends at {previous['end_frame']}, "
+                    f"current starts at {current['start_frame']}"
+                )
+            }
+
+    # ---------------------------------------------------------------
+    # Read project state BEFORE creating anything.
+    # ---------------------------------------------------------------
+
+    before = get_project_info()
+
+    if not isinstance(before, dict):
+        return {"error": "Could not read project info before rebuild"}
+
+    if before.get("error"):
+        return {
+            "error": "Could not read project info before rebuild",
+            "details": before,
+        }
+
+    before_count = before.get("timelineCount")
+
+    if not isinstance(before_count, int):
+        return {
+            "error": "Project info did not contain a valid timelineCount",
+            "details": before,
+        }
+
+    # ---------------------------------------------------------------
+    # Create a NEW timeline.
+    # ---------------------------------------------------------------
+
+    created = _post("/timeline/create", {"name": timeline_name})
+
+    if not isinstance(created, dict) or not created.get("success"):
+        return {
+            "error": "Failed to create output timeline",
+            "details": created,
+        }
+
+    # ---------------------------------------------------------------
+    # Confirm the timeline count increased by exactly one.
+    # ---------------------------------------------------------------
+
+    after = get_project_info()
+
+    if not isinstance(after, dict):
+        return {
+            "error": "Timeline was created, but project state could not be verified",
+            "created_timeline": timeline_name,
+        }
+
+    after_count = after.get("timelineCount")
+
+    if not isinstance(after_count, int) or after_count != before_count + 1:
+        return {
+            "error": "Timeline was created, but timeline count verification failed",
+            "before_count": before_count,
+            "after_count": after_count,
+            "created_timeline": timeline_name,
+        }
+
+    # ---------------------------------------------------------------
+    # Explicitly switch to the newly-created timeline.
+    #
+    # New timelines are appended to the project's timeline list, so
+    # after_count is also the 1-based index of the new timeline.
+    # ---------------------------------------------------------------
+
+    switched = _post("/timeline/switch", {"index": after_count})
+
+    if (
+        not isinstance(switched, dict)
+        or not switched.get("success")
+        or switched.get("timeline") != timeline_name
+    ):
+        return {
+            "error": "Created timeline, but could not safely switch to it",
+            "created_timeline": timeline_name,
+            "switch_result": switched,
+        }
+
+    # ---------------------------------------------------------------
+    # Insert each KEEP segment consecutively.
+    # ---------------------------------------------------------------
+
+    timeline_info = get_timeline_info()
+    if (
+        not isinstance(timeline_info, dict)
+        or timeline_info.get("error")
+        or timeline_info.get("name") != timeline_name
+        or type(timeline_info.get("startFrame")) is not int
+    ):
+        return {
+            "error": "Created timeline, but could not verify its name and start frame",
+            "created_timeline": timeline_name,
+            "timeline_info": timeline_info,
+        }
+
+    timeline_start_frame = timeline_info["startFrame"]
+    record_frame = timeline_start_frame
+    inserted = []
+
+    for i, segment in enumerate(normalized_segments):
+        start = segment["start_frame"]
+        end = segment["end_frame"]
+        duration = segment["duration"]
+
+        payload = {
+            "clipName": clip_name,
+            "trackIndex": track_index,
+            "recordFrame": record_frame,
+            "startFrame": start,
+            "endFrame": end,
+        }
+
+        result = _post("/media/insert", payload)
+
+        if not isinstance(result, dict) or result.get("error") or not result.get("success"):
+            return {
+                "error": f"Insert failed at segment {i}",
+                "timeline": timeline_name,
+                "failed_segment": {
+                    "index": i,
+                    "start_frame": start,
+                    "end_frame": end,
+                    "record_frame": record_frame,
+                },
+                "insert_result": result,
+                "inserted_before_failure": inserted,
+            }
+
+        inserted.append({
+            "index": i,
+            "source_start_frame": start,
+            "source_end_frame": end,
+            "record_start_frame": record_frame,
+            "record_end_frame": record_frame + duration,
+            "duration": duration,
+        })
+
+        record_frame += duration
+
+    # ---------------------------------------------------------------
+    # Return a manifest so the AI can verify exactly what it built.
+    # ---------------------------------------------------------------
+
+    manifest = {
+        "success": True,
+        "timeline": timeline_name,
+        "timeline_index": after_count,
+        "clip_name": clip_name,
+        "track_index": track_index,
+        "segment_count": len(inserted),
+        "total_duration_frames": record_frame - timeline_start_frame,
+        "segments": inserted,
+    }
+
+    actual = get_timeline_info()
+    manifest["timeline_info"] = actual
+    if (
+        not isinstance(actual, dict)
+        or actual.get("error")
+        or actual.get("name") != timeline_name
+        or type(actual.get("startFrame")) is not int
+        or type(actual.get("endFrame")) is not int
+        or actual["startFrame"] != timeline_start_frame
+        or actual["endFrame"] != record_frame
+    ):
+        manifest.update({
+            "success": False,
+            "error": "Segments inserted, but timeline bounds verification failed",
+            "expected_start_frame": timeline_start_frame,
+            "expected_end_frame": record_frame,
+        })
+    return manifest
 
 
 # ═══════════════════════════════════════════════════════════════════════════
